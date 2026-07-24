@@ -1,0 +1,6 @@
+# Ignore temporary lock files
+*.lock
+
+# Ignore heavy Roblox binary map files (keep them safely on your local drive only)
+*.rbxl
+*.rbxlx
