@@ -24,16 +24,10 @@ local function getHipHeight(rig)
 	return distanceToBottom
 end
 
-local function setupNpc(character)
+local function setupNpc(character, npcModel)
 	if not character then return end
 	local plrRoot = character:WaitForChild("HumanoidRootPart", 10)
 	if not plrRoot then return end
-
-	-- clone rig from replicatedstorage
-	--local rigTemplate = RPS:WaitForChild("Rig", 10)
-	--if not rigTemplate then return end
-
-	local npcModel = workspace.Rig
 
 	-- disable collision for smooth client-side cframe movement
 	for _, desc in pairs(npcModel:GetDescendants()) do
@@ -177,8 +171,9 @@ end
 
 -- handle initial character spawn and respawns
 if plr.Character then
-	task.spawn(setupNpc, plr.Character)
+	task.spawn(setupNpc, plr.Character, workspace.Rig)
 end
+
 plr.CharacterAdded:Connect(function(char)
-	task.spawn(setupNpc, char)
+	task.spawn(setupNpc, char, workspace.Rig)
 end)
