@@ -46,7 +46,7 @@ local function setupNpc(character, npcModel)
 	if not character then return end
 	local plrRoot = character:WaitForChild("HumanoidRootPart", 10)
 	if not plrRoot then return end
-	
+
 	-- disable collision for smooth client-side cframe movement
 	for _, desc in pairs(npcModel:GetChildren()) do
 		if desc:IsA("BasePart") then
