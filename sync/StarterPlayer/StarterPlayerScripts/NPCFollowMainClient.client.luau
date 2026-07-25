@@ -72,7 +72,7 @@ local function setupNpc(character, npcModel)
 	local HIP_HEIGHT = getHipHeight(npcModel)
 
 	-- debug visualization toggle
-	local DEBUG_MODE = true
+	local DEBUG_MODE = false
 
 	-- task threshold constants
 	local MAX_VERTICAL_OFFSET = 6.0 -- height difference threshold before y distance factors into magnitude
