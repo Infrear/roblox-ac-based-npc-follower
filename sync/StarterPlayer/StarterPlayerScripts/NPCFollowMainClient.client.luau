@@ -71,6 +71,9 @@ local function setupNpc(character, npcModel)
 	local TURN_SPEED = 10 -- speed scale for smooth turning rotation
 	local HIP_HEIGHT = getHipHeight(npcModel)
 
+	-- debug visualization toggle
+	local DEBUG_MODE = true
+
 	-- task threshold constants
 	local MAX_VERTICAL_OFFSET = 6.0 -- height difference threshold before y distance factors into magnitude
 	local LANDING_DROP_THRESHOLD = 2 -- downward Y drop threshold to trigger landing animation & lerp
@@ -81,6 +84,7 @@ local function setupNpc(character, npcModel)
 	local VERIFY_SAFE_DELAY = 0.5 -- verification delay to ensure target spot is not temporary
 	local FADE_DURATION = 0.3 -- transparency fade duration in seconds
 	local GRAVITY = 150.0 -- downward gravity acceleration scale for falling
+	local CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH = 15.0 -- extra length for cautious double check raycast
 
 	-- animation thresholds based on animation manager reference
 	local SPEED_THRESHOLD = 0.75
@@ -117,6 +121,9 @@ local function setupNpc(character, npcModel)
 	local isLanding = false
 	local landingTime = 0
 	local lastYPosition = npcRoot.Position.Y
+	local lastRayVisTime = 0
+	local isVoidOrDeepFall = false
+	local rayColor = Color3.new(255, 255, 0)
 
 	-- active transparency tweens table following roblox-tween-management workflow
 	local TES = {}
@@ -143,6 +150,77 @@ local function setupNpc(character, npcModel)
 			end
 		end
 		task.wait(fadeTime)
+	end
+
+	-- Visualizes the ahead raycast hit point and ray line with neon yellow fading parts
+	-- rayOrigin - origin vector of raycast
+	-- rayResult - RaycastResult instance or nil
+	local function visualizeAheadRay(rayOrigin, rayResult)
+		if not DEBUG_MODE then return end
+		local now = os.clock()
+		if now - lastRayVisTime < 0.12 then return end
+		lastRayVisTime = now
+
+		local hitPos = rayResult and rayResult.Position or (rayOrigin - Vector3.new(0, DEEP_FALL_RAY_LENGTH, 0))
+		local rayVector = hitPos - rayOrigin
+		local dist = rayVector.Magnitude
+		if dist < 0.1 then return end
+
+		local folder = workspace:FindFirstChild("RayDebugFolder")
+		if not folder then
+			folder = Instance.new("Folder")
+			folder.Name = "RayDebugFolder"
+			folder.Parent = workspace
+		end
+
+		-- vertical line pointing down from origin to hit position
+		local linePart = Instance.new("Part")
+		linePart.Name = "DebugRayLine"
+		linePart.Size = Vector3.new(0.08, dist, 0.08)
+		linePart.CFrame = CFrame.lookAt(rayOrigin + rayVector * 0.5, hitPos) * CFrame.Angles(math.pi / 2, 0, 0)
+		linePart.Material = Enum.Material.Neon
+		linePart.Color = (not isVoidOrDeepFall)  and Color3.fromRGB(255, 255, 0) or Color3.new(1)
+		linePart.Anchored = true
+		linePart.CanCollide = false
+		linePart.CanQuery = false
+		linePart.CanTouch = false
+		linePart.AudioCanCollide = false
+		linePart.Transparency = 1
+		linePart.Parent = folder
+
+		-- sphere part at hit position
+		local hitPart = Instance.new("Part")
+		hitPart.Name = "DebugRayHit"
+		hitPart.Shape = Enum.PartType.Ball
+		hitPart.Size = Vector3.new(0.6, 0.6, 0.6)
+		hitPart.Position = hitPos
+		hitPart.Material = Enum.Material.Neon
+		hitPart.Color = (not isVoidOrDeepFall) and Color3.fromRGB(255, 255, 0) or Color3.new(1)
+		hitPart.Anchored = true
+		hitPart.CanCollide = false
+		hitPart.CanQuery = false
+		hitPart.CanTouch = false
+		hitPart.AudioCanCollide = false
+		hitPart.Transparency = 1
+		hitPart.Parent = folder
+
+		task.spawn(function()
+			local fadeInTI = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			local fadeOutTI = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+
+			TS:Create(linePart, fadeInTI, { Transparency = 0.3 }):Play()
+			TS:Create(hitPart, fadeInTI, { Transparency = 0 }):Play()
+
+			task.wait(0.5)
+
+			TS:Create(linePart, fadeOutTI, { Transparency = 1 }):Play()
+			local outTween = TS:Create(hitPart, fadeOutTI, { Transparency = 1 })
+			outTween:Play()
+			outTween.Completed:Wait()
+
+			linePart:Destroy()
+			hitPart:Destroy()
+		end)
 	end
 
 	-- Plays a specific animation state with smooth transition time
@@ -348,7 +426,7 @@ local function setupNpc(character, npcModel)
 		isTeleporting = false
 		currentTeleportReason = nil
 	end
-
+	
 	-- main render loop for client-side follower movement
 	local connection
 	connection = RS.RenderStepped:Connect(function(dt)
@@ -438,16 +516,26 @@ local function setupNpc(character, npcModel)
 			local nextZ = currentPos.Z + moveStep.Z
 
 			-- task 3: raycast ahead straight down at proposed position to check for void or deep fall
-			local aheadRayOrigin = Vector3.new(nextX, currentPos.Y + 5, nextZ)
+			local aheadRayOrigin = Vector3.new(nextX + (isVoidOrDeepFall and (moveStep.X * CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0), currentPos.Y + 5, nextZ + (isVoidOrDeepFall and (moveStep.Z * CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0))
 			local aheadRayResult = workspace:Raycast(aheadRayOrigin, Vector3.new(0, -DEEP_FALL_RAY_LENGTH, 0), raycastParams)
 
-			local isVoidOrDeepFall = false
+			-- debug visualization of ahead raycast hit point and downward line
+			visualizeAheadRay(aheadRayOrigin, aheadRayResult)
+			
+			if isVoidOrDeepFall then
+				rayColor = Color3.new(1, 0.5)
+			end
+			
 			if not aheadRayResult then
 				isVoidOrDeepFall = true
+				rayColor = Color3.new(1)
 			else
 				local dropDepth = currentPos.Y - aheadRayResult.Position.Y
 				if dropDepth > MAX_SAFE_FALL_DEPTH then
 					isVoidOrDeepFall = true
+					rayColor = Color3.new(1)
+				else
+					isVoidOrDeepFall = false
 				end
 			end
 
