@@ -15,6 +15,8 @@ raycastParams.FilterDescendantsInstances = {}
 -- Calculates hip height distance from root part center to model bottom
 -- rig - the NPC model instance
 local function getHipHeight(rig)
+	if not rig then return 2.67 end
+
 	local rootPart = rig.PrimaryPart or rig:FindFirstChild("HumanoidRootPart")
 	local fallback = rig:GetAttribute("HipHeightFallback") or 2.67
 
@@ -43,56 +45,78 @@ local function getHipHeight(rig)
 	return distanceToBottom
 end
 
-local function setupNpc(character, npcModel)
-	if not character then return end
-	local plrRoot = character:WaitForChild("HumanoidRootPart", 10)
-	if not plrRoot then return end
+local FollowerNPC = {}
+FollowerNPC.__index = FollowerNPC
+
+-- config = { Animations = { Idle = "rbxassetid://...", Walk = "...", Run = "..." } }
+function FollowerNPC.new(sourceModel: Model, config)
+	config = config or {}
+	local self = setmetatable({}, FollowerNPC)
+
+	self.rig = sourceModel -- use passed-in model directly without cloning
+
+	-- strip old humanoid if present so physics don't fight manual cframe movement
+	local oldHumanoid = self.rig:FindFirstChildOfClass("Humanoid")
+	if oldHumanoid then oldHumanoid:Destroy() end
 
 	-- disable collision for smooth client-side cframe movement
-	for _, desc in pairs(npcModel:GetChildren()) do
+	for _, desc in ipairs(self.rig:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			desc.CanCollide = false
 		end
 	end
 
-	-- exclude player character and npc from ground raycasts
-	raycastParams:AddToFilter(character)
-	raycastParams:AddToFilter(npcModel)
+	self.controller = self.rig:FindFirstChildOfClass("AnimationController") or Instance.new("AnimationController")
+	self.controller.Parent = self.rig
+	self.animator = self.controller:FindFirstChildOfClass("Animator") or Instance.new("Animator", self.controller)
 
-	local ac = npcModel:WaitForChild("AnimationController")
-	local npcRoot = npcModel.PrimaryPart or npcModel:WaitForChild("HumanoidRootPart")
-	npcRoot.Anchored = true --> actually only anchor the root for smooth client-side cframe movement
+	-- stop any pre-existing playing animation tracks on animator
+	for _, track in ipairs(self.animator:GetPlayingAnimationTracks()) do
+		track:Stop(0.1)
+	end
 
-	-- initial spawn position near player
-	local initialPos = plrRoot.Position + Vector3.new(3, 0, 3)
-	npcModel:PivotTo(CFrame.new(initialPos))
+	self.rootPart = self.rig.PrimaryPart or self.rig:FindFirstChild("HumanoidRootPart")
+	if self.rootPart then
+		self.rootPart.Anchored = true
+	end
 
-	local DISTANCE_START_FOLLOW = 10
-	local DISTANCE_STOP_FOLLOW = 4
-	local MOVE_SPEED = 12
-	local TURN_SPEED = 10 -- speed scale for smooth turning rotation
-	local HIP_HEIGHT = getHipHeight(npcModel)
-
-	-- debug visualization toggle
-	local DEBUG_MODE = true
+	-- pdisconnect from clouds that have this rig attached to their float cycle
+	if self.rig:FindFirstChild("FloatsAttachedTo") then
+		for _, v in pairs(self.rig:FindFirstChild("FloatsAttachedTo"):GetChildren()) do
+			if v:IsA("ValueBase") and v.Value and v.Value:IsA("ValueBase") and v.Value.Value and v.Value.Value == self.rig then
+				--print(v.Value.Value)
+				v.Value.Value = nil
+			end
+		end
+	end
 
 	-- task threshold constants
-	local MAX_VERTICAL_OFFSET = 6.0 -- height difference threshold before y distance factors into magnitude
-	local LANDING_DROP_THRESHOLD = 2 -- downward Y drop threshold to trigger landing animation & lerp
-	local MAX_SAFE_FALL_DEPTH = 25.0 -- maximum safe downward drop depth before treating as deep fall/void
-	local DEEP_FALL_RAY_LENGTH = 50.0 -- downward raycast depth for void detection
-	local MAX_TELEPORT_RANGE = 60.0 -- maximum distance before triggering vanish teleport sequence
-	local TELEPORT_WAIT_DELAY = 1.5 -- initial delay in seconds before attempting teleport
-	local VERIFY_SAFE_DELAY = 0.5 -- verification delay to ensure target spot is not temporary
-	local FADE_DURATION = 0.3 -- transparency fade duration in seconds
-	local GRAVITY = 150.0 -- downward gravity acceleration scale for falling
-	local CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH = 15.0 -- extra length for cautious double check raycast
-	local MAX_LOOK_UP_ANGLE = math.rad(80)     -- must exceed this to START the pause
-	local MIN_LOOK_UP_EXIT_ANGLE = math.rad(60) -- must drop below THIS to be considered resolved
+	self.DISTANCE_START_FOLLOW = 10
+	self.DISTANCE_STOP_FOLLOW = 4
+	self.MOVE_SPEED = 12
+	self.TURN_SPEED = 10 -- speed scale for smooth turning rotation
+	self.HIP_HEIGHT = self.rig:GetAttribute("HipHeightFallback") --getHipHeight(self.rig)
+
+	-- debug visualization toggle
+	self.DEBUG_MODE = false
+
+	self.MAX_VERTICAL_OFFSET = 6.0 -- height difference threshold before y distance factors into magnitude
+	self.LANDING_DROP_THRESHOLD = 2 -- downward Y drop threshold to trigger landing animation & lerp
+	self.MAX_SAFE_FALL_DEPTH = 25.0 -- maximum safe downward drop depth before treating as deep fall/void
+	self.DEEP_FALL_RAY_LENGTH = 50.0 -- downward raycast depth for void detection
+	self.MAX_TELEPORT_RANGE = 60.0 -- maximum distance before triggering vanish teleport sequence
+	self.TELEPORT_WAIT_DELAY = 1.5 -- initial delay in seconds before attempting teleport
+	self.VERIFY_SAFE_DELAY = 0.5 -- verification delay to ensure target spot is not temporary
+	self.FADE_DURATION = 0.3 -- transparency fade duration in seconds
+	self.GRAVITY = 150.0 -- downward gravity acceleration scale for falling
+	self.CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH = 15.0 -- extra length for cautious double check raycast
+	self.FORWARD_EDGE_BUFFER = 2.5 -- forward look-ahead distance in studs to detect ledges before stepping over
+	self.MAX_LOOK_UP_ANGLE = math.rad(80)     -- must exceed this to START the pause
+	self.MIN_LOOK_UP_EXIT_ANGLE = math.rad(60) -- must drop below THIS to be considered resolved
 
 	-- animation thresholds based on animation manager reference
-	local SPEED_THRESHOLD = 0.75
-	local RUN_THRESHOLD = 8.0
+	self.SPEED_THRESHOLD = 0.75
+	self.RUN_THRESHOLD = 8.0
 
 	local fallbackAnimStrings = {
 		Idle = "http://www.roblox.com/asset/?id=507766388",
@@ -103,546 +127,488 @@ local function setupNpc(character, npcModel)
 		Land = "http://www.roblox.com/asset/?id=15719965221",
 	}
 
-	local animTracks = {}
-	local hasWalkAnim = npcModel:FindFirstChild("Walk") ~= nil
+	self.animTracks = {}
+	local animConfig = config.Animations or {}
 
-	for name, assetId in pairs(fallbackAnimStrings) do
-		if npcModel:FindFirstChild(name) then
-			animTracks[name] = ac.Animator:LoadAnimation(npcModel:FindFirstChild(name))
-		else
-			local anim = Instance.new("Animation")
-			anim.Name = name
-			anim.AnimationId = assetId
-			anim.Parent = npcModel
-			animTracks[name] = ac.Animator:LoadAnimation(anim)
-		end
+	for name, fallbackAssetId in pairs(fallbackAnimStrings) do
+		local animId = animConfig[name] or (self.rig:FindFirstChild(name) and self.rig:FindFirstChild(name).AnimationId) or fallbackAssetId
+		local anim = Instance.new("Animation")
+		anim.Name = name
+		anim.AnimationId = animId
+		self.animTracks[name] = self.animator:LoadAnimation(anim)
 	end
 
-	local isFollowing = false
-	local currentAnimState = nil
-	local isFalling = false
-	local fallVelocity = 0
-	local isLanding = false
-	local landingTime = 0
-	local lastYPosition = npcRoot.Position.Y
-	local lastRayVisTime = 0
-	local isVoidOrDeepFall = false
-	local rayColor = Color3.new(255, 255, 0)
-
-	-- active transparency tweens table following roblox-tween-management workflow
-	local TES = {}
-
-	-- Tweens all baseparts, decals, and textures in the model to target transparency
-	-- model                       - model instance to fade
-	-- targetTransparency          - target numeric transparency (0 to 1)
-	-- duration                    - fade duration in seconds
-	-- fallbacktoOgTransparency   - if true, restores stored original transparency attribute
-	local function fadeModelTransparency(model, targetTransparency, duration, fallbacktoOgTransparency)
-		local fadeTime = duration or FADE_DURATION
-		local TI = TweenInfo.new(fadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
-		for _, desc in ipairs(model:GetDescendants()) do
-			if desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("Texture") then
-				if not desc:GetAttribute("OgTransparency") then
-					desc:SetAttribute("OgTransparency", desc.Transparency)
-				end
-				if TES[desc] and TES[desc].PlaybackState == Enum.PlaybackState.Playing then
-					TES[desc]:Cancel()
-				end
-				TES[desc] = TS:Create(desc, TI, { Transparency = fallbacktoOgTransparency and desc:GetAttribute("OgTransparency") or targetTransparency })
-				TES[desc]:Play()
-			end
-		end
-		task.wait(fadeTime)
-	end
-
-	-- Visualizes the ahead raycast hit point and ray line with neon yellow fading parts
-	-- rayOrigin - origin vector of raycast
-	-- rayResult - RaycastResult instance or nil
-	local function visualizeAheadRay(rayOrigin, rayResult)
-		if not DEBUG_MODE then return end
-		local now = os.clock()
-		if now - lastRayVisTime < 0.12 then return end
-		lastRayVisTime = now
-
-		local hitPos = rayResult and rayResult.Position or (rayOrigin - Vector3.new(0, DEEP_FALL_RAY_LENGTH, 0))
-		local rayVector = hitPos - rayOrigin
-		local dist = rayVector.Magnitude
-		if dist < 0.1 then return end
-
-		local folder = workspace:FindFirstChild("RayDebugFolder")
-		if not folder then
-			folder = Instance.new("Folder")
-			folder.Name = "RayDebugFolder"
-			folder.Parent = workspace
-		end
-
-		-- vertical line pointing down from origin to hit position
-		local linePart = Instance.new("Part")
-		linePart.Name = "DebugRayLine"
-		linePart.Size = Vector3.new(0.08, dist, 0.08)
-		linePart.CFrame = CFrame.lookAt(rayOrigin + rayVector * 0.5, hitPos) * CFrame.Angles(math.pi / 2, 0, 0)
-		linePart.Material = Enum.Material.Neon
-		linePart.Color = (not isVoidOrDeepFall)  and Color3.fromRGB(255, 255, 0) or Color3.new(1)
-		linePart.Anchored = true
-		linePart.CanCollide = false
-		linePart.CanQuery = false
-		linePart.CanTouch = false
-		linePart.AudioCanCollide = false
-		linePart.Transparency = 1
-		linePart.Parent = folder
-
-		-- sphere part at hit position
-		local hitPart = Instance.new("Part")
-		hitPart.Name = "DebugRayHit"
-		hitPart.Shape = Enum.PartType.Ball
-		hitPart.Size = Vector3.new(0.6, 0.6, 0.6)
-		hitPart.Position = hitPos
-		hitPart.Material = Enum.Material.Neon
-		hitPart.Color = (not isVoidOrDeepFall) and Color3.fromRGB(255, 255, 0) or Color3.new(1)
-		hitPart.Anchored = true
-		hitPart.CanCollide = false
-		hitPart.CanQuery = false
-		hitPart.CanTouch = false
-		hitPart.AudioCanCollide = false
-		hitPart.Transparency = 1
-		hitPart.Parent = folder
-
-		task.spawn(function()
-			local fadeInTI = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-			local fadeOutTI = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-
-			TS:Create(linePart, fadeInTI, { Transparency = 0.3 }):Play()
-			TS:Create(hitPart, fadeInTI, { Transparency = 0 }):Play()
-
-			task.wait(0.5)
-
-			TS:Create(linePart, fadeOutTI, { Transparency = 1 }):Play()
-			local outTween = TS:Create(hitPart, fadeOutTI, { Transparency = 1 })
-			outTween:Play()
-			outTween.Completed:Wait()
-
-			linePart:Destroy()
-			hitPart:Destroy()
-		end)
-	end
-
-	-- Plays a specific animation state with smooth transition time
-	-- stateName      - "Idle", "Walk", "Run", or "Land"
-	-- transitionTime - optional crossfade duration in seconds
-	local function setAnimState(stateName, transitionTime)
-		local fadeTime = transitionTime or 0.35
-		if currentAnimState == stateName then return end
-		currentAnimState = stateName
-		for name, track in pairs(animTracks) do
-			if name == stateName then
-				if not track.IsPlaying then
-					track:Play(fadeTime)
-				end
-			else
-				if name ~= "Jump" and name ~= "Fall" then
-					if track.IsPlaying then
-						track:Stop(fadeTime)
-					end
-				end
-			end
-		end
-	end
-
-	-- Adjusts active animation playback speed according to current movement velocity
-	-- speed - current movement speed in studs per second
-	-- scale - speed scaling factor
-	local function setAnimationSpeed(speed, scale)
-		local currentTrack = animTracks[currentAnimState]
-		if currentTrack and currentTrack.IsPlaying then
-			currentTrack:AdjustSpeed(speed / scale)
-		end
-	end
-
-	local function getEffectiveDistance(posA, posB)
-		local flatA = Vector3.new(posA.X, 0, posA.Z)
-		local flatB = Vector3.new(posB.X, 0, posB.Z)
-		local horizontalDist = (flatB - flatA).Magnitude
-
-		local yDiff = math.abs(posB.Y - posA.Y)
-		local effectiveY = 0
-		if yDiff > MAX_VERTICAL_OFFSET then
-			effectiveY = yDiff - MAX_VERTICAL_OFFSET
-		end
-
-		return math.sqrt(horizontalDist^2 + effectiveY^2)
-	end
-
-	setAnimState("Idle", 0.1)
-
-	-- Checks whether the player is currently near-vertically aligned with the NPC
-	-- (directly above or below), the exact geometry that collapses the horizontal
-	-- direction vector to zero and breaks dir/rotation math downstream.
-	local function isLookingStraightUp(force)
-		local currentPos = npcRoot.Position
-		local targetPos = plrRoot.Position
-		local flatCurrent = Vector3.new(currentPos.X, 0, currentPos.Z)
-		local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
-		local horizontalDist = (flatTarget - flatCurrent).Magnitude
-		local yDiff = math.abs(targetPos.Y - currentPos.Y)
-
-		if yDiff < 1 then return false end -- not enough vertical gap for this to be ambiguous
-
-		local angle = math.atan2(yDiff, horizontalDist)
-		return angle > (force or MAX_LOOK_UP_ANGLE)
-	end
+	self.hasWalkAnim = self.animTracks["Walk"] ~= nil
+	self.isFollowing = false
+	self.currentAnimState = nil
+	self.isFalling = false
+	self.fallVelocity = 0
+	self.isLanding = false
+	self.landingTime = 0
+	self.lastYPosition = self.rootPart and self.rootPart.Position.Y or 0
+	self.lastRayVisTime = 0
+	self.isVoidOrDeepFall = false
 
 	-- state tracking for delayed teleport routine
-	local isTeleporting = false
-	local currentTeleportReason = nil
-	local teleportToken = 0
+	self.isTeleporting = false
+	self.currentTeleportReason = nil
+	self.teleportToken = 0
 
-	-- Checks if a position behind the player offers safe ground
-	-- targetPos - player root position
-	local function getSafeTeleportCFrame(targetPos)
-		-- test multiple offsets: behind, right, left, front, modify to ur liking ngl, i prefer only behind
-		local offsets = {
-			CFrame.new(0, 0, 3),   
-			CFrame.new(3, 0, 0),   
-			CFrame.new(-3, 0, 0),  
-			CFrame.new(0, 0, -3),  
-		}
+	-- active transparency tweens table following roblox-tween-management workflow
+	self.TES = {}
+	self.renderConn = nil
 
-		for _, offsetCFrame in ipairs(offsets) do
-			local teleportTarget = plrRoot.CFrame * offsetCFrame
-			local teleRayOrigin = Vector3.new(teleportTarget.Position.X, targetPos.Y + 5, teleportTarget.Position.Z)
-			local teleRayResult = workspace:Raycast(teleRayOrigin, Vector3.new(0, -DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+	self:_setAnimState("Idle", 0.1)
 
-			if teleRayResult then
-				local safeY = teleRayResult.Position.Y + HIP_HEIGHT
+	return self
+end
 
-				-- check #1 is this a safe fall depth relative to the player?
-				if math.abs(safeY - targetPos.Y) < MAX_SAFE_FALL_DEPTH then
+-- Tweens all baseparts, decals, and textures in the model to target transparency
+-- targetTransparency          - target numeric transparency (0 to 1)
+-- duration                    - fade duration in seconds
+-- fallbacktoOgTransparency   - if true, restores stored original transparency attribute
+function FollowerNPC:FadeModelTransparency(targetTransparency, duration, fallbacktoOgTransparency)
+	local fadeTime = duration or self.FADE_DURATION
+	local TI = TweenInfo.new(fadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
-					-- check #2 will this spot trigger the "looking straight up" bug
-					local flatCurrent = Vector3.new(teleportTarget.Position.X, 0, teleportTarget.Position.Z)
-					local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
-					local horizontalDist = (flatTarget - flatCurrent).Magnitude
-					local yDiff = math.abs(targetPos.Y - safeY)
+	for _, desc in ipairs(self.rig:GetDescendants()) do
+		if desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("Texture") then
+			if not desc:GetAttribute("OgTransparency") then
+				desc:SetAttribute("OgTransparency", desc.Transparency)
+			end
+			if self.TES[desc] and self.TES[desc].PlaybackState == Enum.PlaybackState.Playing then
+				self.TES[desc]:Cancel()
+			end
+			self.TES[desc] = TS:Create(desc, TI, { Transparency = fallbacktoOgTransparency and desc:GetAttribute("OgTransparency") or targetTransparency })
+			self.TES[desc]:Play()
+		end
+	end
+	task.wait(fadeTime)
+end
 
-					-- approve if on similar Y-level OR if the angle is comfortably below the threshold
-					if yDiff < 1 or math.atan2(yDiff, horizontalDist) <= MIN_LOOK_UP_EXIT_ANGLE then
-						return CFrame.new(teleportTarget.Position.X, safeY, teleportTarget.Position.Z) * plrRoot.CFrame.Rotation
-					end
+-- Plays a specific animation state with smooth transition time
+-- stateName      - "Idle", "Walk", "Run", or "Land"
+-- transitionTime - optional crossfade duration in seconds
+function FollowerNPC:_setAnimState(stateName, transitionTime)
+	local fadeTime = transitionTime or 0.35
+	if self.currentAnimState == stateName then return end
+	self.currentAnimState = stateName
+	for name, track in pairs(self.animTracks) do
+		if name == stateName then
+			if not track.IsPlaying then
+				track:Play(fadeTime)
+			end
+		else
+			if name ~= "Jump" and name ~= "Fall" then
+				if track.IsPlaying then
+					track:Stop(fadeTime)
 				end
 			end
 		end
+	end
+end
 
-		-- if all spots are invalid (e.g., player is falling in the void), just drop them right on top of the player
-		--return CFrame.new(targetPos.X, targetPos.Y + HIP_HEIGHT, targetPos.Z) * plrRoot.CFrame.Rotation
-		-- actually nah I wanna make bro wait instead for now, maybe ill renable this later but for now, nah
-		return nil
+-- Adjusts active animation playback speed according to current movement velocity
+-- speed - current movement speed in studs per second
+-- scale - speed scaling factor
+function FollowerNPC:_setAnimationSpeed(speed, scale)
+	local currentTrack = self.animTracks[self.currentAnimState]
+	if currentTrack and currentTrack.IsPlaying then
+		currentTrack:AdjustSpeed(speed / scale)
+	end
+end
+
+function FollowerNPC:_getEffectiveDistance(posA, posB)
+	local flatA = Vector3.new(posA.X, 0, posA.Z)
+	local flatB = Vector3.new(posB.X, 0, posB.Z)
+	local horizontalDist = (flatB - flatA).Magnitude
+
+	local yDiff = math.abs(posB.Y - posA.Y)
+	local effectiveY = 0
+	if yDiff > self.MAX_VERTICAL_OFFSET then
+		effectiveY = yDiff - self.MAX_VERTICAL_OFFSET
 	end
 
-	-- Checks if the path directly in front of the NPC is currently walkable towards the player
-	local function checkPathAheadWalkable()
-		local currentPos = npcRoot.Position
-		local targetPos = plrRoot.Position
-		local flatCurrent = Vector3.new(currentPos.X, 0, currentPos.Z)
-		local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
-		local horizontalDist = (flatTarget - flatCurrent).Magnitude
+	return math.sqrt(horizontalDist^2 + effectiveY^2)
+end
 
-		if horizontalDist <= 0.1 then return true end
+-- Checks whether the player is currently near-vertically aligned with the NPC
+-- (directly above or below) — the exact geometry that collapses the horizontal
+-- direction vector to zero and breaks dir/rotation math downstream.
+function FollowerNPC:_isLookingStraightUp(plrRoot, force)
+	local currentPos = self.rootPart.Position
+	local targetPos = plrRoot.Position
+	local flatCurrent = Vector3.new(currentPos.X, 0, currentPos.Z)
+	local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
+	local horizontalDist = (flatTarget - flatCurrent).Magnitude
+	local yDiff = math.abs(targetPos.Y - currentPos.Y)
 
-		local dir = (flatTarget - flatCurrent).Unit
+	if yDiff < 1 then return false end -- not enough vertical gap for this to be ambiguous
 
-		-- sample multiple points along path towards player to prevent false positive ground reads near cliff edges
-		local sampleDistance = math.min(horizontalDist, DISTANCE_START_FOLLOW)
-		local stepSize = 1.5
-		local steps = math.max(math.floor(sampleDistance / stepSize), 1)
+	local angle = math.atan2(yDiff, horizontalDist)
+	return angle > (force or self.MAX_LOOK_UP_ANGLE)
+end
 
-		for i = 1, steps do
-			local distAhead = i * stepSize
-			local sampleX = currentPos.X + dir.X * distAhead
-			local sampleZ = currentPos.Z + dir.Z * distAhead
+-- Checks if a position behind the player offers safe ground
+-- targetPos - player root position
+function FollowerNPC:_getSafeTeleportCFrame(plrRoot, targetPos)
+	local offsets = {
+		CFrame.new(0, 0, 3),
+		CFrame.new(3, 0, 0),
+		CFrame.new(-3, 0, 0),
+		CFrame.new(0, 0, -3),
+	}
 
-			local rayOrigin = Vector3.new(sampleX, currentPos.Y + 5, sampleZ)
-			local rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+	for _, offsetCFrame in ipairs(offsets) do
+		local teleportTarget = plrRoot.CFrame * offsetCFrame
+		local teleRayOrigin = Vector3.new(teleportTarget.Position.X, targetPos.Y + 5, teleportTarget.Position.Z)
+		local teleRayResult = workspace:Raycast(teleRayOrigin, Vector3.new(0, -self.DEEP_FALL_RAY_LENGTH, 0), raycastParams)
 
-			if not rayResult then
-				return false -- void detected along path
-			end
+		if teleRayResult then
+			local safeY = teleRayResult.Position.Y + self.HIP_HEIGHT
 
-			local dropDepth = currentPos.Y - rayResult.Position.Y
-			if dropDepth > MAX_SAFE_FALL_DEPTH then
-				return false -- deep fall detected along path
+			if math.abs(safeY - targetPos.Y) < self.MAX_SAFE_FALL_DEPTH then
+				local flatCurrent = Vector3.new(teleportTarget.Position.X, 0, teleportTarget.Position.Z)
+				local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
+				local horizontalDist = (flatTarget - flatCurrent).Magnitude
+				local yDiff = math.abs(targetPos.Y - safeY)
+
+				if yDiff < 1 or math.atan2(yDiff, horizontalDist) <= self.MIN_LOOK_UP_EXIT_ANGLE then
+					return CFrame.new(teleportTarget.Position.X, safeY, teleportTarget.Position.Z) * plrRoot.CFrame.Rotation
+				end
 			end
 		end
-
-		return true
 	end
 
-	-- Executes the delayed teleport sequence with double-check verification and fade animations
-	-- targetPos - player root position
-	-- reason    - "OutOfRange" or "VoidOrDeepFall"
-	local function triggerTeleportSequence(targetPos, reason)
-		if isTeleporting then return end
-		isTeleporting = true
-		currentTeleportReason = reason
-		teleportToken += 1
-		local localToken = teleportToken
+	return nil
+end
 
-		-- phase 1: initial 1.5s delay while standing idle
-		setAnimState("Idle", 0.35)
-		task.wait(TELEPORT_WAIT_DELAY)
-		if localToken ~= teleportToken then
-			-- Simply exit; do NOT overwrite isTeleporting or currentTeleportReason
+-- Checks if the path directly in front of the NPC is currently walkable towards the player
+function FollowerNPC:_checkPathAheadWalkable(plrRoot)
+	local currentPos = self.rootPart.Position
+	local targetPos = plrRoot.Position
+	local flatCurrent = Vector3.new(currentPos.X, 0, currentPos.Z)
+	local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
+	local horizontalDist = (flatTarget - flatCurrent).Magnitude
+
+	if horizontalDist <= 0.1 then return true end
+
+	local dir = (flatTarget - flatCurrent).Unit
+
+	-- sample multiple points along path towards player to prevent false positive ground reads near cliff edges
+	local sampleDistance = math.min(horizontalDist, self.DISTANCE_START_FOLLOW)
+	local stepSize = 1.5
+	local steps = math.max(math.floor(sampleDistance / stepSize), 1)
+
+	for i = 1, steps do
+		local distAhead = i * stepSize
+		local sampleX = currentPos.X + dir.X * distAhead
+		local sampleZ = currentPos.Z + dir.Z * distAhead
+
+		local rayOrigin = Vector3.new(sampleX, currentPos.Y + 5, sampleZ)
+		local rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -self.DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+
+		if not rayResult then
+			return false -- void detected along path
+		end
+
+		local dropDepth = currentPos.Y - rayResult.Position.Y
+		if dropDepth > self.MAX_SAFE_FALL_DEPTH then
+			return false -- deep fall detected along path
+		end
+	end
+
+	return true
+end
+
+-- Executes the delayed teleport sequence with double-check verification and fade animations
+-- targetPos - player root position
+-- reason    - "OutOfRange" or "VoidOrDeepFall"
+function FollowerNPC:_triggerTeleportSequence(plrRoot, targetPos, reason)
+	if self.isTeleporting then return end
+	self.isTeleporting = true
+	self.currentTeleportReason = reason
+	self.teleportToken += 1
+	local localToken = self.teleportToken
+
+	-- phase 1: initial 1.5s delay while standing idle
+	self:_setAnimState("Idle", 0.35)
+	task.wait(self.TELEPORT_WAIT_DELAY)
+
+	-- check cancellation condition based on trigger reason
+	if localToken ~= self.teleportToken then
+		return
+	end
+
+	if reason == "OutOfRange" then
+		local curPlrPos = plrRoot.Position
+		local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+		if curDist <= self.MAX_TELEPORT_RANGE then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
+			end
 			return
 		end
-
-		-- check cancellation condition based on trigger reason
-		if reason == "OutOfRange" then
+	elseif reason == "VoidOrDeepFall" then
+		if self:_checkPathAheadWalkable(plrRoot) then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
 			local curPlrPos = plrRoot.Position
-			local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-			if curDist <= MAX_TELEPORT_RANGE then
-				isTeleporting = false
-				currentTeleportReason = nil
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
+			local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
 			end
-		elseif reason == "VoidOrDeepFall" then
-			if checkPathAheadWalkable() then
-				isTeleporting = false
-				currentTeleportReason = nil
-				local curPlrPos = plrRoot.Position
-				local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
-			end
-		elseif reason == "LookingStraightUp" then
-			if not isLookingStraightUp() then
-				isTeleporting = false
-				currentTeleportReason = nil
-				local curPlrPos = plrRoot.Position
-				local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
-			end
-		end
-
-		-- phase 2: check if initial safe spot exists behind player
-		local safeCFrame = getSafeTeleportCFrame(targetPos)
-		if not safeCFrame then
-			isTeleporting = false
-			currentTeleportReason = nil
 			return
 		end
-
-		-- phase 3: verification delay (0.5s) to ensure target spot is not temporary
-		task.wait(VERIFY_SAFE_DELAY)
-
-		if localToken ~= teleportToken then
-			-- js exit; do NOT overwrite isTeleporting or currentTeleportReason
-			return
-		end
-
-		-- re-check cancellation condition after verification delay
-		if reason == "OutOfRange" then
+	elseif reason == "LookingStraightUp" then
+		if not self:_isLookingStraightUp(plrRoot) then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
 			local curPlrPos = plrRoot.Position
-			local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-			if curDist <= MAX_TELEPORT_RANGE then
-				isTeleporting = false
-				currentTeleportReason = nil
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
+			local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
 			end
-		elseif reason == "VoidOrDeepFall" then
-			if checkPathAheadWalkable() then
-				isTeleporting = false
-				currentTeleportReason = nil
-				local curPlrPos = plrRoot.Position
-				local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
-			end
-		elseif reason == "LookingStraightUp" then
-			if not isLookingStraightUp() then
-				isTeleporting = false
-				currentTeleportReason = nil
-				local curPlrPos = plrRoot.Position
-				local curDist = getEffectiveDistance(npcRoot.Position, curPlrPos)
-				if curDist <= DISTANCE_STOP_FOLLOW then
-					isFollowing = false
-				end
-				return
-			end
-		end
-
-		-- phase 4: re-verify safe spot after verification delay
-		local finalSafeCFrame = getSafeTeleportCFrame(plrRoot.Position)
-		if not finalSafeCFrame then
-			isTeleporting = false
-			currentTeleportReason = nil
 			return
 		end
-
-		-- phase 5: execute vanish (fade out) -> teleport -> reappear (fade in)
-		fadeModelTransparency(npcModel, 1.0, FADE_DURATION)
-		if localToken ~= teleportToken then
-			fadeModelTransparency(npcModel, 0.0, FADE_DURATION, true)
-			return -- let the new thread handle the global variables
-		end
-
-		npcModel:PivotTo(finalSafeCFrame)
-		lastYPosition = finalSafeCFrame.Position.Y
-		isFalling = false
-		fallVelocity = 0
-
-		fadeModelTransparency(npcModel, 0.0, FADE_DURATION, true)
-		isTeleporting = false
-		currentTeleportReason = nil
 	end
 
-	-- idle gravity logic
-	-- dt - (delta) time elapsed since last frame
-	local function applyIdleGravity(dt)
-		local currentPos = npcRoot.Position
-		local rayOrigin = Vector3.new(currentPos.X, currentPos.Y + 5, currentPos.Z)
-		local rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+	-- phase 2: check if initial safe spot exists behind player
+	local safeCFrame = self:_getSafeTeleportCFrame(plrRoot, targetPos)
+	if not safeCFrame then
+		self.isTeleporting = false
+		self.currentTeleportReason = nil
+		return
+	end
 
-		if rayResult then
-			local targetGroundY = rayResult.Position.Y + HIP_HEIGHT
-			local yDrop = currentPos.Y - targetGroundY
+	-- phase 3: verification delay (0.5s) to ensure target spot is not temporary
+	task.wait(self.VERIFY_SAFE_DELAY)
 
-			if yDrop > 0.1 then
-				if not isFalling then
-					isFalling = true
-					fallVelocity = 0
-				end
+	if localToken ~= self.teleportToken then
+		return
+	end
 
-				-- calculate gravity while standing still
-				fallVelocity = fallVelocity + GRAVITY * dt
-				local nextY = currentPos.Y - fallVelocity * dt
-
-				if nextY <= targetGroundY then
-					nextY = targetGroundY
-					isFalling = false
-					fallVelocity = 0
-					setAnimState("Land", 0.1)
-				end
-
-				-- preserve current rotation, only update Y
-				local rotCFrame = npcRoot.CFrame - npcRoot.CFrame.Position
-				npcModel:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * rotCFrame)
-				lastYPosition = nextY
+	-- re-check cancellation condition after verification delay
+	if reason == "OutOfRange" then
+		local curPlrPos = plrRoot.Position
+		local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+		if curDist <= self.MAX_TELEPORT_RANGE then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
 			end
+			return
+		end
+	elseif reason == "VoidOrDeepFall" then
+		if self:_checkPathAheadWalkable(plrRoot) then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
+			local curPlrPos = plrRoot.Position
+			local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
+			end
+			return
+		end
+	elseif reason == "LookingStraightUp" then
+		if not self:_isLookingStraightUp(plrRoot) then
+			self.isTeleporting = false
+			self.currentTeleportReason = nil
+			local curPlrPos = plrRoot.Position
+			local curDist = self:_getEffectiveDistance(self.rootPart.Position, curPlrPos)
+			if curDist <= self.DISTANCE_STOP_FOLLOW then
+				self.isFollowing = false
+			end
+			return
 		end
 	end
+
+	-- phase 4: re-verify safe spot after verification delay
+	local finalSafeCFrame = self:_getSafeTeleportCFrame(plrRoot, plrRoot.Position)
+	if not finalSafeCFrame then
+		self.isTeleporting = false
+		self.currentTeleportReason = nil
+		return
+	end
+
+	-- phase 5: execute vanish (fade out) -> teleport -> reappear (fade in)
+	self:FadeModelTransparency(1.0, self.FADE_DURATION)
+	if localToken ~= self.teleportToken then
+		self:FadeModelTransparency(0.0, self.FADE_DURATION, true)
+		return
+	end
+
+	self.rig:PivotTo(finalSafeCFrame)
+	self.lastYPosition = finalSafeCFrame.Position.Y
+	self.isFalling = false
+	self.fallVelocity = 0
+
+	self:FadeModelTransparency(0.0, self.FADE_DURATION, true)
+	self.isTeleporting = false
+	self.currentTeleportReason = nil
+end
+
+function FollowerNPC:_updateGrounding(dt, targetX, targetZ, overrideRayResult)
+	local currentPos = self.rootPart.Position
+	local rayResult = overrideRayResult
+
+	if not rayResult then
+		local rayOrigin = Vector3.new(targetX, currentPos.Y + 5, targetZ)
+		rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -self.DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+	end
+
+	local targetGroundY = rayResult and (rayResult.Position.Y + self.HIP_HEIGHT) or currentPos.Y
+	local nextY = targetGroundY
+
+	-- gravity fall lerp & land animation at end
+	local yDrop = self.lastYPosition - targetGroundY
+	if yDrop > self.LANDING_DROP_THRESHOLD and not self.isFalling and not self.isLanding then
+		self.isFalling = true
+		self.fallVelocity = 0
+	end
+
+	if self.isFalling then
+		-- accelerate downward like gravity
+		self.fallVelocity = self.fallVelocity + self.GRAVITY * dt
+		nextY = self.lastYPosition - self.fallVelocity * dt
+
+		-- check if ground reached
+		if nextY <= targetGroundY then
+			nextY = targetGroundY
+			self.isFalling = false
+			self.fallVelocity = 0
+
+			-- play landing animation ONLY at the end upon ground contact
+			self.isLanding = true
+			self.landingTime = 0.35
+			self:_setAnimState("Land", 0.1)
+		end
+	elseif self.isLanding then
+		self.landingTime = self.landingTime - dt
+		if self.landingTime <= 0 then
+			self.isLanding = false
+		end
+	end
+
+	self.lastYPosition = nextY
+	return nextY
+end
+
+function FollowerNPC:StartFollowing(getTargetPosition)
+	if self.renderConn then return end
+
+	local char = plr.Character or plr.CharacterAdded:Wait()
+	local plrRoot = char:WaitForChild("HumanoidRootPart", 10)
+	if not plrRoot then return end
+
+	-- exclude player character and npc from ground raycasts
+	raycastParams:AddToFilter(char)
+	raycastParams:AddToFilter(self.rig)
 
 	-- main render loop for client-side follower movement
-	local connection
-	connection = RS.RenderStepped:Connect(function(dt)
-		if not npcModel or not npcModel.Parent or not character or not character.Parent then
-			if connection then connection:Disconnect() end
-			if npcModel then npcModel:Destroy() end
+	self.renderConn = RS.RenderStepped:Connect(function(dt)
+		if not self.rig or not self.rig.Parent or not char or not char.Parent then
+			self:Stop()
 			return
 		end
 
-		local currentPos = npcRoot.Position
-		local targetPos = plrRoot.Position
+		local getPosResult = getTargetPosition and getTargetPosition()
+		local targetPos = getPosResult or plrRoot.Position
+		local currentPos = self.rootPart.Position
 
-		-- calculate horizontal distance with conditional vertical offset threshold
+		-- task 1: calculate horizontal distance with conditional vertical offset threshold
 		local flatCurrent = Vector3.new(currentPos.X, 0, currentPos.Z)
 		local flatTarget = Vector3.new(targetPos.X, 0, targetPos.Z)
 		local horizontalDist = (flatTarget - flatCurrent).Magnitude
 
-		local yDiff = math.abs(targetPos.Y - currentPos.Y)
-		local effectiveY = 0
-		if yDiff > MAX_VERTICAL_OFFSET then
-			effectiveY = yDiff - MAX_VERTICAL_OFFSET
-		end
-
-		local dist = getEffectiveDistance(currentPos, targetPos)
+		local dist = self:_getEffectiveDistance(currentPos, targetPos)
 
 		-- state update for follow distance threshold
-		if not isFollowing and dist > DISTANCE_START_FOLLOW then
-			isFollowing = true
-		elseif isFollowing and dist <= DISTANCE_STOP_FOLLOW then
-			isFollowing = false
+		if not self.isFollowing and dist > self.DISTANCE_START_FOLLOW then
+			self.isFollowing = true
+		elseif self.isFollowing and dist <= self.DISTANCE_STOP_FOLLOW then
+			self.isFollowing = false
 		end
 
-		-- out of range check, if player moves further than MAX_TELEPORT_RANGE, trigger teleport routine
-		if dist > MAX_TELEPORT_RANGE then
-			if not isTeleporting then
-				task.spawn(triggerTeleportSequence, targetPos, "OutOfRange")
+		-- out of range check: if player moves further than MAX_TELEPORT_RANGE, trigger teleport routine
+		if dist > self.MAX_TELEPORT_RANGE then
+			if not self.isTeleporting then
+				task.spawn(function()
+					self:_triggerTeleportSequence(plrRoot, targetPos, "OutOfRange")
+				end)
 			end
-			setAnimState("Idle", 0.35)
-			applyIdleGravity(dt)
+			self:_setAnimState("Idle", 0.35)
+			local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+			self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 			return
 		end
 
 		-- if teleport is active, hold idle state unless cancellation criteria is met
-		if isTeleporting then
-			if currentTeleportReason == "OutOfRange" then
-				if dist <= MAX_TELEPORT_RANGE then
-					teleportToken += 1
-					isTeleporting = false
-					currentTeleportReason = nil
-					if dist <= DISTANCE_STOP_FOLLOW then
-						isFollowing = false
+		if self.isTeleporting then
+			if self.currentTeleportReason == "OutOfRange" then
+				if dist <= self.MAX_TELEPORT_RANGE then
+					self.teleportToken += 1
+					self.isTeleporting = false
+					self.currentTeleportReason = nil
+					if dist <= self.DISTANCE_STOP_FOLLOW then
+						self.isFollowing = false
 					end
 				else
-					setAnimState("Idle", 0.35)
-					applyIdleGravity(dt)
+					self:_setAnimState("Idle", 0.35)
+					local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+					self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 					return
 				end
-			elseif currentTeleportReason == "VoidOrDeepFall" then
-				if checkPathAheadWalkable() then
-					teleportToken += 1
-					isTeleporting = false
-					currentTeleportReason = nil
-					if dist <= DISTANCE_STOP_FOLLOW then
-						isFollowing = false
+			elseif self.currentTeleportReason == "VoidOrDeepFall" then
+				if self:_checkPathAheadWalkable(plrRoot) then
+					self.teleportToken += 1
+					self.isTeleporting = false
+					self.currentTeleportReason = nil
+					if dist <= self.DISTANCE_STOP_FOLLOW then
+						self.isFollowing = false
 					end
 				else
-					setAnimState("Idle", 0.35)
-					applyIdleGravity(dt)
+					self:_setAnimState("Idle", 0.35)
+					local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+					self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 					return
 				end
-			elseif currentTeleportReason == "LookingStraightUp" then
-				if not isLookingStraightUp(MIN_LOOK_UP_EXIT_ANGLE) then
-					teleportToken += 1
-					isTeleporting = false
-					currentTeleportReason = nil
-					if dist <= DISTANCE_STOP_FOLLOW then
-						isFollowing = false
+			elseif self.currentTeleportReason == "LookingStraightUp" then
+				if not self:_isLookingStraightUp(plrRoot, self.MIN_LOOK_UP_EXIT_ANGLE) then
+					self.teleportToken += 1
+					self.isTeleporting = false
+					self.currentTeleportReason = nil
+					if dist <= self.DISTANCE_STOP_FOLLOW then
+						self.isFollowing = false
 					end
 				else
-					setAnimState("Idle", 0.35)
-					applyIdleGravity(dt)
+					self:_setAnimState("Idle", 0.35)
+					local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+					self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 					return
 				end
 			end
 		end
 
-		if isFollowing then
-			if isLookingStraightUp() then
-				if not isTeleporting then
-					task.spawn(triggerTeleportSequence, targetPos, "LookingStraightUp")
+		if self.isFollowing then
+			if self:_isLookingStraightUp(plrRoot) then
+				if not self.isTeleporting then
+					task.spawn(function()
+						self:_triggerTeleportSequence(plrRoot, targetPos, "LookingStraightUp")
+					end)
 				end
-				setAnimState("Idle", 0.35)
-				applyIdleGravity(dt)
+				self:_setAnimState("Idle", 0.35)
+				local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+				self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 				return
 			end
 
 			-- calculate move direction on xz plane
 			local dir = (flatTarget - flatCurrent).Unit
-			local moveStep = dir * (MOVE_SPEED * dt)
+			local moveStep = dir * (self.MOVE_SPEED * dt)
 
 			-- prevent overshooting target
 			if moveStep.Magnitude > horizontalDist then
@@ -654,131 +620,113 @@ local function setupNpc(character, npcModel)
 			local nextX = currentPos.X + moveStep.X
 			local nextZ = currentPos.Z + moveStep.Z
 
-			-- raycast ahead straight down at proposed position to check for void or deep fall
-			local aheadRayOrigin = Vector3.new(nextX + (isVoidOrDeepFall and (moveStep.X * CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0), currentPos.Y + 5, nextZ + (isVoidOrDeepFall and (moveStep.Z * CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0))
-			local aheadRayResult = workspace:Raycast(aheadRayOrigin, Vector3.new(0, -DEEP_FALL_RAY_LENGTH, 0), raycastParams)
+			-- task 3: raycast ahead straight down at proposed position to check for void or deep fall
+			-- original raycast for ground position calculation & hysteresis
+			local aheadRayOrigin = Vector3.new(nextX + (self.isVoidOrDeepFall and (moveStep.X * self.CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0), currentPos.Y + 5, nextZ + (self.isVoidOrDeepFall and (moveStep.Z * self.CAUTIOUS_DOUBLE_CHECK_EXTRA_LENGTH) or 0))
+			local aheadRayResult = workspace:Raycast(aheadRayOrigin, Vector3.new(0, -self.DEEP_FALL_RAY_LENGTH, 0), raycastParams)
 
-			-- debug visualization of ahead raycast hit point and downward line
-			visualizeAheadRay(aheadRayOrigin, aheadRayResult)
+			-- second raycast projected ahead along movement vector for ledge buffer check
+			local forwardCheckOrigin = Vector3.new(nextX + dir.X * self.FORWARD_EDGE_BUFFER, currentPos.Y + 5, nextZ + dir.Z * self.FORWARD_EDGE_BUFFER)
+			local forwardCheckResult = workspace:Raycast(forwardCheckOrigin, Vector3.new(0, -self.DEEP_FALL_RAY_LENGTH, 0), raycastParams)
 
-			if isVoidOrDeepFall then
-				rayColor = Color3.new(1, 0.5)
-			end
+			local origIsVoid = not aheadRayResult or ((currentPos.Y - aheadRayResult.Position.Y) > self.MAX_SAFE_FALL_DEPTH)
+			local forwardIsVoid = not forwardCheckResult or ((currentPos.Y - forwardCheckResult.Position.Y) > self.MAX_SAFE_FALL_DEPTH)
 
-			if not aheadRayResult then
-				isVoidOrDeepFall = true
-				rayColor = Color3.new(1)
+			if origIsVoid or forwardIsVoid then
+				self.isVoidOrDeepFall = true
 			else
-				local dropDepth = currentPos.Y - aheadRayResult.Position.Y
-				if dropDepth > MAX_SAFE_FALL_DEPTH then
-					isVoidOrDeepFall = true
-					rayColor = Color3.new(1)
-				else
-					isVoidOrDeepFall = false
-				end
+				self.isVoidOrDeepFall = false
 			end
 
-			if isVoidOrDeepFall then
+			if self.isVoidOrDeepFall then
 				-- void/deep fall detected ahead: trigger delayed teleport routine while remaining idle
-				if not isTeleporting then
-					task.spawn(triggerTeleportSequence, targetPos, "VoidOrDeepFall")
+				if not self.isTeleporting then
+					task.spawn(function()
+						self:_triggerTeleportSequence(plrRoot, targetPos, "VoidOrDeepFall")
+					end)
 				end
-				setAnimState("Idle", 0.35)
-				applyIdleGravity(dt)
+				self:_setAnimState("Idle", 0.35)
+				local nextY = self:_updateGrounding(dt, currentPos.X, currentPos.Z)
+				self.rig:PivotTo(CFrame.new(currentPos.X, nextY, currentPos.Z) * (self.rootPart.CFrame - self.rootPart.CFrame.Position))
 				return
 			end
 
 			-- safe floor detected ahead
-			local targetGroundY = aheadRayResult.Position.Y + HIP_HEIGHT
-			local nextY = targetGroundY
+			local nextY = self:_updateGrounding(dt, nextX, nextZ, aheadRayResult)
 
-			-- gravity fall lerp & land animation at end
-			local yDrop = lastYPosition - targetGroundY
-			if yDrop > LANDING_DROP_THRESHOLD and not isFalling and not isLanding then
-				isFalling = true
-				fallVelocity = 0
-			end
-
-			if isFalling then
-				-- accelerate downward like gravity
-				fallVelocity = fallVelocity + GRAVITY * dt
-				nextY = lastYPosition - fallVelocity * dt
-
-				-- check if ground reached
-				if nextY <= targetGroundY then
-					nextY = targetGroundY
-					isFalling = false
-					fallVelocity = 0
-
-					-- play landing animation ONLY at the end upon ground contact
-					isLanding = true
-					landingTime = 0.35
-					setAnimState("Land", 0.1)
-				end
-			elseif isLanding then
-				landingTime = landingTime - dt
-				if landingTime <= 0 then
-					isLanding = false
-				end
-			else
-				-- walk/run animation blending logic
-				if hasWalkAnim then
-					if currentSpeed > RUN_THRESHOLD then
-						setAnimState("Run", 0.5)
-						setAnimationSpeed(currentSpeed, 12.0)
-					elseif currentSpeed > SPEED_THRESHOLD then
-						setAnimState("Walk", 0.5)
-						setAnimationSpeed(currentSpeed, 5.0)
+			-- walk/run animation blending logic
+			if not self.isFalling and not self.isLanding then
+				if self.hasWalkAnim then
+					if currentSpeed > self.RUN_THRESHOLD then
+						self:_setAnimState("Run", 0.5)
+						self:_setAnimationSpeed(currentSpeed, 12.0)
+					elseif currentSpeed > self.SPEED_THRESHOLD then
+						self:_setAnimState("Walk", 0.5)
+						self:_setAnimationSpeed(currentSpeed, 5.0)
 					else
-						setAnimState("Idle", 0.35)
+						self:_setAnimState("Idle", 0.35)
 					end
 				else
-					setAnimState("Run", 0.35)
-					setAnimationSpeed(currentSpeed, MOVE_SPEED)
+					self:_setAnimState("Run", 0.35)
+					self:_setAnimationSpeed(currentSpeed, self.MOVE_SPEED)
 				end
 			end
 
-			lastYPosition = nextY
+			self.lastYPosition = nextY
 			local nextPos = Vector3.new(nextX, nextY, nextZ)
 			local lookTarget = Vector3.new(targetPos.X, nextY, targetPos.Z)
 
 			local horizontalDelta = lookTarget - nextPos
-			local currentCFrame = npcRoot.CFrame
+			local currentCFrame = self.rootPart.CFrame
 			local lerpedRotation
 
 			if horizontalDelta.Magnitude > 0.01 then
 				local targetCFrame = CFrame.lookAt(nextPos, lookTarget)
-				lerpedRotation = currentCFrame.Rotation:Lerp(targetCFrame.Rotation, math.clamp(TURN_SPEED * dt, 0, 1))
+				lerpedRotation = currentCFrame.Rotation:Lerp(targetCFrame.Rotation, math.clamp(self.TURN_SPEED * dt, 0, 1))
 			else
-				-- horizontally on top of / directly under the target, no valid direction
+				-- horizontally on top of / directly under the target — no valid direction
 				-- to face, so just hold whatever rotation we already had this frame
 				lerpedRotation = currentCFrame.Rotation
 			end
 
-			npcModel:PivotTo(CFrame.new(nextPos) * lerpedRotation)
+			self.rig:PivotTo(CFrame.new(nextPos) * lerpedRotation)
 		else
-			setAnimState("Idle", 0.35)
+			self:_setAnimState("Idle", 0.35)
 
 			-- raycast check to maintain ground position while standing still without rotating
 			local rayOrigin = Vector3.new(currentPos.X, currentPos.Y + 5, currentPos.Z)
 			local rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -20, 0), raycastParams)
 			if rayResult then
-				local targetY = rayResult.Position.Y + HIP_HEIGHT
+				local targetY = rayResult.Position.Y + self.HIP_HEIGHT
 				if math.abs(currentPos.Y - targetY) > 0.05 then
-					local rotCFrame = npcRoot.CFrame - npcRoot.CFrame.Position
-					npcModel:PivotTo(CFrame.new(currentPos.X, targetY, currentPos.Z) * rotCFrame)
-					lastYPosition = targetY
+					local rotCFrame = self.rootPart.CFrame - self.rootPart.CFrame.Position
+					self.rig:PivotTo(CFrame.new(currentPos.X, targetY, currentPos.Z) * rotCFrame)
+					self.lastYPosition = targetY
 				end
 			end
 		end
 	end)
 end
 
--- handle initial character spawn and respawns
-if plr.Character then
-	task.spawn(setupNpc, plr.Character, workspace:WaitForChild("Rig"))
+function FollowerNPC:Stop()
+	if self.renderConn then
+		self.renderConn:Disconnect()
+		self.renderConn = nil
+	end
+	self.teleportToken += 1
+	self.isTeleporting = false
+	self.currentTeleportReason = nil
+	self:_setAnimState("Idle", 0.35)
 end
 
-plr.CharacterAdded:Connect(function(char)
-	task.spawn(setupNpc, char, workspace:WaitForChild("Rig"))
-end)
+function FollowerNPC:Destroy()
+	self:Stop()
+	for _, tween in pairs(self.TES) do
+		if tween and tween.PlaybackState == Enum.PlaybackState.Playing then
+			tween:Cancel()
+		end
+	end
+	self.TES = {}
+end
+
+return FollowerNPC

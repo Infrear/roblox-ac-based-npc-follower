@@ -1435,21 +1435,22 @@
           "guid": "156811",
           "children": [
             {
-              "name": "NPCFollowMainClient",
-              "className": "LocalScript",
-              "guid": "147706",
-              "filePaths": [
-                "sync/StarterPlayer/StarterPlayerScripts/NPCFollowMainClient.client.luau"
-              ]
-            },
-            {
               "name": "Client",
               "className": "LocalScript",
               "guid": "471131",
               "filePaths": [
                 "sync/StarterPlayer/StarterPlayerScripts/Client.client.luau"
               ],
-              "children": []
+              "children": [
+                {
+                  "name": "FollowerNPC",
+                  "className": "ModuleScript",
+                  "guid": "471668",
+                  "filePaths": [
+                    "sync/StarterPlayer/StarterPlayerScripts/Client/FollowerNPC.luau"
+                  ]
+                }
+              ]
             },
             {
               "name": "DistanceTracker",
