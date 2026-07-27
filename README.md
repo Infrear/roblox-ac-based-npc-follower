@@ -21,7 +21,7 @@ sync/
 
 ## setup
 1. clone/sync this repo using **azul** or **rojo** into roblox studio.
-2. place your follower npc model inside `ServerStorage` (or wherever your setup loads it).
+2. place your follower npc model inside `workspace`, `ServerStorage` (or wherever your setup loads it, right now I have it in workspace).
 3. test in play mode - the follower will auto setup on client spawn.
 
 ## how it works
