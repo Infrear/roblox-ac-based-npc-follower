@@ -4,3 +4,6 @@
 # Ignore heavy Roblox binary map files (keep them safely on your local drive only)
 *.rbxl
 *.rbxlx
+
+# Ignore the sourcemap file
+sourcemap.json
