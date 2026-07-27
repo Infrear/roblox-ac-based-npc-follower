@@ -13,9 +13,10 @@ client-side CFrame based follower system for roblox. built for smooth movement, 
 ```
 sync/
 ├─ StarterPlayer/StarterPlayerScripts/
-│  └─ NPCFollowMainClient.client.luau   # core follower system & state machine
+│  └─ Client.client.luau                 # example module usage
+│    └─ FollowerNPC.luau                 # core follower system & state machine, main module (migrated to oop)
 ├─ ServerScriptService/                  # server setup & spawning logic
-└─ ServerStorage/                       # npc models & animations
+└─ ServerStorage/                        # npc models & animations
 ```
 
 ## setup
